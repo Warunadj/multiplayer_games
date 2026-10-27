@@ -35,6 +35,26 @@ All tests must pass before a task is considered done.
 - Seats: S, W, N, E. Turn order is clockwise: S → W → N → E. South moves first.
 - 2 players: S and N. 3 players: S, W, N (East arm empty). 4 players: all.
 
+### Players, seats and teams (2–8 players)
+
+The game supports 2–8 humans, each on their own device, joining by room code. The board always has at most 4 seats;
+extra players become partners on a seat.
+
+| Humans | Seats |
+|---|---|
+| 2–4 | one human per seat; empty seats may be filled by bots |
+| 5–8 | 4 seats; seats are filled first with one human each, then a second human is added to seats in order S, W, N, E |
+
+Team seat rules (a seat with two humans):
+- Both partners see the seat's true piece types and share the chip stack.
+- Partners alternate who controls the seat's MOVE each time it is that seat's turn (the "driver" badge shows whose turn it is).
+- Either partner may press **Bluff!** during an opponent's challenge window, and either partner may respond (Show / Fold / Raise / Call / Back down) — the first valid action wins.
+- Partners get quick pings visible only to their team: "Bluff it", "Play honest", "Call it", "Let it go".
+- The engine is unchanged: it still sees one seat per arm. Teams are a server/client concept mapping several sockets to one seat.
+
+Host lobby: shows all joined players, lets the host drag players between seats, and auto-balances (solo seats first, then pairs).
+The game must be fully playable with 8 humans on 8 devices.
+
 ## 3. Pieces
 
 Each player has 8 pieces: K, Q, R, B, N, P, P, P. This composition is public.
@@ -197,6 +217,8 @@ Simulation script: `npm run simulate -- --games 500` plays bot-only games with f
 - Disconnect: after 30 s a sentinel bot plays the seat; the human can reclaim it on return.
 - Timers (challenge window, 45 s turn timer, disconnect grace) run on the server; clients get `endsAt` timestamps to draw countdowns.
 - Spectators join by link and get `viewFor(state, 'spectator')`.
+- Teams: a seat may map to up to 2 sockets. Both receive `viewFor(state, seat)`. The server tracks the current driver per seat and rejects `move:declare` / `move:pass` from the non-driver. Team pings use `team:ping {kind}` and are delivered only to the partner.
+- Room capacity: 8 players plus unlimited spectators. A 9th joiner becomes a spectator.
 
 ---
 
