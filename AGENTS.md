@@ -1,6 +1,6 @@
 # AGENTS.md — Called Bluff
 
-Called Bluff is a 2–4 player browser game: chess with hidden piece identities plus poker-style bluff calling.
+Called Bluff is a real-time party game for 2–8 players, each on their own device, joining by room code: chess with hidden piece identities plus poker-style bluff calling.
 Every piece is face-down to opponents. Every move is a claim ("this is a Bishop"). Any claim can be challenged with chips.
 
 This file is the source of truth for rules and architecture. If code and this file disagree, this file wins.
@@ -13,12 +13,17 @@ If a rule is ambiguous, choose the simplest reading, implement it, and note it i
 npm workspaces monorepo, TypeScript strict mode everywhere.
 
 ```
-/engine   pure rules engine + bots (no DOM, no Node APIs, no dependencies). Vitest tests.
-/client   Vite + React + TypeScript. Runs "Play vs bots" fully in-browser using /engine.
-/server   Node + Express + Socket.IO. Online rooms. Holds the only full game state.
+/engine                       pure rules engine + bots (no DOM, no Node APIs, no dependencies). Vitest tests.
+/client                       Vite + React + TypeScript. Runs "Play vs bots" fully in-browser using /engine.
+/backend                      room logic helpers (rooms, seats, teams, lazy clock, bot scheduling). Imported by the function.
+/netlify/functions/game.ts    the ONLY server entry point: a standard Netlify Function. Keep helpers OUT of this folder.
+netlify.toml                  build = root build, publish = client/dist, functions = netlify/functions
 ```
 
-Commands that must work from the repo root: `npm install`, `npm test`, `npm run dev` (client + server), `npm run build`.
+Hosting target is Netlify: static client + one Netlify Function + Netlify Blobs. There is NO continuously running server,
+no WebSockets, and no background timers. No environment variables, API keys, or manual database setup may be required.
+
+Commands that must work from the repo root: `npm install`, `npm test`, `npm run dev` (client + local function via `netlify dev` or an equivalent local shim), `npm run build`.
 All tests must pass before a task is considered done.
 
 ---
@@ -50,7 +55,7 @@ Team seat rules (a seat with two humans):
 - Partners alternate who controls the seat's MOVE each time it is that seat's turn (the "driver" badge shows whose turn it is).
 - Either partner may press **Bluff!** during an opponent's challenge window, and either partner may respond (Show / Fold / Raise / Call / Back down) — the first valid action wins.
 - Partners get quick pings visible only to their team: "Bluff it", "Play honest", "Call it", "Let it go".
-- The engine is unchanged: it still sees one seat per arm. Teams are a server/client concept mapping several sockets to one seat.
+- The engine is unchanged: it still sees one seat per arm. Teams are a backend/client concept mapping several member tokens to one seat.
 
 Host lobby: shows all joined players, lets the host drag players between seats, and auto-balances (solo seats first, then pairs).
 The game must be fully playable with 8 humans on 8 devices.
@@ -136,6 +141,7 @@ export const CONFIG = {
   disconnectGraceMs: 30000,
   turnCap: 60,
   passPenalty: 1,
+  pollIntervalMs: 700,
 };
 ```
 
@@ -200,25 +206,45 @@ Shark challenges when P(lie) − (1 − P(lie)) > 0.1, with stake = round(2 + 4 
 
 Responding: honest piece → Show, except an honest King → Fold. Lying piece → Raise with raise probability, else Fold. As challenger facing a raise → Call if P(lie) > 0.5, else Back down.
 
-Bots act after a random 0.8–2.5 s delay (client/server side, not in /engine).
+Bots act after a random 0.8–2.5 s delay (scheduled by the client in local games and by the backend lazy clock online, never inside /engine).
 
 Simulation script: `npm run simulate -- --games 500` plays bot-only games with fixed seeds and prints: mean turns, % moves challenged, % claims that were bluffs, % games ending by bankruptcy, win rate by seat, win rate by bot style.
 
 ---
 
-## 12. Server (online rooms)
+## 12. Online rooms (Netlify Function + Netlify Blobs)
 
-- The server holds the only full `GameState`. Every socket receives `viewFor(state, theirSeat)` after every change. Never emit full state.
-- Clients send intents only; the server validates every action through the engine.
-- Events, client → server: `room:create`, `room:join {code, name, rejoinToken?}`, `seat:setBot {seat, style|null}` (host only), `game:start` (host only), `setup:submit {placements}`, `setup:quick`, `move:declare {pieceId, claim, to}`, `move:pass`, `challenge:call {stake}`, `challenge:respond {action}`.
-- Events, server → client: `state {view}`, `event {logEntry}`, `error {message}`.
-- Room codes: 4 uppercase letters (no I or O). Share link: `/room/CODE`.
-- Rejoin: a token stored in localStorage reclaims the same seat after refresh.
-- Disconnect: after 30 s a sentinel bot plays the seat; the human can reclaim it on return.
-- Timers (challenge window, 45 s turn timer, disconnect grace) run on the server; clients get `endsAt` timestamps to draw countdowns.
+Architecture:
+- One function, `netlify/functions/game.ts`, handles every request: `POST /.netlify/functions/game` with JSON `{ op, code?, token?, ...args }`.
+  The frontend calls `/.netlify/functions/game` directly. Do not use `config.path` or an `/api/game` redirect.
+- Each room is one record in a Netlify Blobs store `rooms` (key = room code), read with strong consistency and written with
+  conditional writes (ETag / onlyIfMatch). On a write conflict, re-read, re-apply the request, retry up to 5 times.
+- Room record: `{ version, game: GameState | null, lobby, members: { token, name, seat | 'spectator', lastSeenAt }[], hostToken, driverBySeat, botDueAt, pings, createdAt }`.
+- The function holds the only full `GameState`. Every response returns `viewFor(state, callerSeat)` plus the caller's lobby info.
+  Never return full state. Tokens are random 128-bit strings; a token is the only proof of seat ownership.
+
+Ops (client → function): `create {name}`, `join {code, name, token?}`, `poll {code, token, sinceVersion}`, `setBot {seat, style|null}` (host),
+`assignSeat {memberToken, seat}` (host), `start` (host), `setup {placements}`, `quickSetup`, `declareMove {pieceId, claim, to}`, `pass`,
+`challenge {stake}`, `respond {action}`, `ping {kind}`. Every op returns `{ version, view, lobby, events, error? }`.
+
+Lazy clock (there are no background timers):
+- Every request first calls `advance(room, now)` before handling the op. `advance` loops until nothing changes:
+  expired challenge window → `noChallenge`; expired 45 s turn timer → `timeout` (pass + penalty); bot actions whose `botDueAt ≤ now`;
+  members with `lastSeenAt` older than 30 s → seat taken over by a sentinel bot (reclaimed when they return).
+- When a bot must act, schedule `botDueAt = now + random(800–2500 ms)` using the room's seeded RNG.
+- Clients poll every 700 ms (`CONFIG.pollIntervalMs`) and also immediately after any action. `poll` with an unchanged `sinceVersion` returns `{ version, unchanged: true }` to keep responses small.
+- Countdown rings are drawn from `endsAt` timestamps in the view; the client never decides when a timer expires.
+
+Rooms and players:
+- Room codes: 4 uppercase letters (no I or O). Share link: `/room/CODE`. Rooms expire 6 hours after last activity.
+- Rejoin: the token stored in localStorage reclaims the same seat after refresh or on a new tab.
 - Spectators join by link and get `viewFor(state, 'spectator')`.
-- Teams: a seat may map to up to 2 sockets. Both receive `viewFor(state, seat)`. The server tracks the current driver per seat and rejects `move:declare` / `move:pass` from the non-driver. Team pings use `team:ping {kind}` and are delivered only to the partner.
-- Room capacity: 8 players plus unlimited spectators. A 9th joiner becomes a spectator.
+- Teams: a seat may map to up to 2 members. Both receive `viewFor(state, seat)`. The function tracks the driver per seat and rejects
+  `declareMove` / `pass` from the non-driver. Pings are returned only to the partner.
+- Capacity: 8 players plus spectators. A 9th joiner becomes a spectator.
+- Validate every op through the engine; reject anything from a token that does not own the acting seat.
+
+Local testing: two browser windows (one normal, one Incognito) must be able to create and join the same room on the local dev URL.
 
 ---
 
